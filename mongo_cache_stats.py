@@ -10,8 +10,33 @@ if len(sys.argv) < 2:
 
 connection_string = sys.argv[1]
 
-# Main Loop
-client = MongoClient(connection_string, tlsCAFile=certifi.where())
+# Try to connect with both methods
+def get_mongodb_connection(conn_string):
+    # First try without SSL
+    try:
+        client = MongoClient(conn_string, serverSelectionTimeoutMS=5000)
+        # Test the connection with a quick command
+        client.admin.command('ping')
+        print("Connected successfully without SSL")
+        return client
+    except Exception as e:
+        print(f"Non-SSL connection failed: {e}")
+        
+        # If that fails, try with SSL
+        try:
+            client = MongoClient(conn_string, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+            # Test the connection
+            client.admin.command('ping')
+            print("Connected successfully with SSL")
+            return client
+        except Exception as e:
+            print(f"SSL connection also failed: {e}")
+            print("Could not connect to MongoDB. Please check your connection string and network.")
+            sys.exit(1)
+
+# Get a connection using the auto-detection function
+client = get_mongodb_connection(connection_string)
+
 db = client.admin
 
 # Retrieve server status information
