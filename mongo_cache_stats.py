@@ -15,6 +15,10 @@ from pymongo import MongoClient
 import time
 from tabulate import tabulate
 
+# Hard-coded overhead factors (to be refined with real customer data)
+COLLECTION_CACHE_OVERHEAD = 1.25  # Collections use ~25% more space in cache than data size
+INDEX_CACHE_OVERHEAD = 0.80       # Indexes use ~20% less space in cache than storage size
+
 # Validate command-line arguments
 if len(sys.argv) < 2:
     print("Please provide a MongoDB connection string as a command-line argument.")
@@ -109,6 +113,19 @@ for dbName in dbNames:
                 "pagesUsed": 0
             })
 
+        # Get initial collection stats for data/storage size
+        try:
+            collStats = db[collectionName].command("collstats", collectionName)
+            data_size = collStats.get("size", 0)
+            storage_size = collStats.get("storageSize", data_size)
+            doc_count = collStats.get("count", 0)
+            avg_doc_size = collStats.get("avgObjSize", 0)
+        except:
+            data_size = 0
+            storage_size = 0
+            doc_count = 0
+            avg_doc_size = 0
+
         # Add collection to tracking list with initial zero values
         collectionInfos.append({
             "db": dbName,
@@ -117,6 +134,10 @@ for dbName in dbNames:
             "cacheRead": 0,
             "cacheWrite": 0,
             "pagesUsed": 0,
+            "dataSize": data_size,
+            "storageSize": storage_size,
+            "docCount": doc_count,
+            "avgDocSize": avg_doc_size,
             "indexesInfo": indexesInfo
         })
 
@@ -129,8 +150,12 @@ while True:
     # Clear the console for fresh output
     print('\033[2J')
 
+    # Get total cache size for percentage calculations
+    server_status = db.command("serverStatus")
+    total_cache_size = server_status["wiredTiger"]["cache"]["maximum bytes configured"]
+
     # Setup table headers
-    headers = ["Collection", "Size", "Cached", "%age", "Delta", "Read", "Written", "Used"]
+    headers = ["Namespace", "Type", "Cache Used", "Data Size", "Storage Size", "% Cached", "Delta", "Read", "Written", "Used"]
     table_data = []
 
     # Iterate through all tracked collections
@@ -147,14 +172,21 @@ while True:
             continue
 
         # Extract current cache statistics from WiredTiger metrics
-        inCache = int(collStats["wiredTiger"]["cache"]["bytes currently in the cache"])
+        doc_cache_bytes = int(collStats["wiredTiger"]["cache"]["bytes currently in the cache"])
         cacheRead = int(collStats["wiredTiger"]["cache"]["bytes read into cache"])
         cacheWrite = int(collStats["wiredTiger"]["cache"]["bytes written from cache"])
         pagesUsed = int(collStats["wiredTiger"]["cache"]["pages requested from the cache"])
-        collSize = collStats["size"] + collStats["totalIndexSize"]
+
+        # Get size information
+        data_size = collStats.get("size", 0)
+        storage_size = collStats.get("storageSize", data_size)
+
+        # Update stored values for size tracking
+        collInfo["dataSize"] = data_size
+        collInfo["storageSize"] = storage_size
 
         # Calculate per-second deltas based on previous measurement
-        sizeDiff = int((inCache - collInfo["inCache"]) / reportTime)
+        sizeDiff = int((doc_cache_bytes - collInfo["inCache"]) / reportTime)
         readDiff = int((cacheRead - collInfo["cacheRead"]) / reportTime)
         writeDiff = int((cacheWrite - collInfo["cacheWrite"]) / reportTime)
         pageUseDiff = int((pagesUsed - collInfo["pagesUsed"]) / reportTime)
@@ -162,15 +194,22 @@ while True:
         # Build fully qualified namespace (db.collection)
         ns = collInfo["db"] + "." + collInfo["coll"]
 
-        # Calculate cache percentage and add to table
-        if collSize > 0:
-            pc = int((inCache / collSize) * 100)
-            table_data.append([ns, collSize, inCache, pc, sizeDiff, readDiff, writeDiff, pageUseDiff])
+        # Adjust cache bytes by removing overhead to get effective cached data
+        adjusted_doc_cache = doc_cache_bytes / COLLECTION_CACHE_OVERHEAD
+
+        # Calculate % Cached using adjusted cache (removes overhead effect)
+        doc_cache_pct = (adjusted_doc_cache / data_size * 100) if data_size > 0 else 0
+        doc_cache_pct = min(doc_cache_pct, 100.0)  # Cap at 100%
+
+        # Add collection row to table
+        if data_size > 0:
+            table_data.append([ns, "Collection", doc_cache_bytes, data_size, storage_size,
+                             f"{doc_cache_pct:.1f}%", sizeDiff, readDiff, writeDiff, pageUseDiff])
         else:
             continue
 
         # Update stored values for next iteration's delta calculation
-        collInfo["inCache"] = inCache
+        collInfo["inCache"] = doc_cache_bytes
         collInfo["cacheRead"] = cacheRead
         collInfo["cacheWrite"] = cacheWrite
         collInfo["pagesUsed"] = pagesUsed
@@ -181,34 +220,41 @@ while True:
 
             # Extract index-specific cache statistics
             indexStats = collStats["indexDetails"][indexName]
-            indexInCache = int(indexStats["cache"]["bytes currently in the cache"])
+            index_cache_bytes = int(indexStats["cache"]["bytes currently in the cache"])
             indexCacheRead = int(indexStats["cache"]["bytes read into cache"])
             indexCacheWrite = int(indexStats["cache"]["bytes written from cache"])
             indexPagesUsed = int(indexStats["cache"]["pages requested from the cache"])
-            indexSize = collStats["indexSizes"][indexName]
+            index_size = collStats["indexSizes"][indexName]
 
             # Calculate per-second deltas for index
-            sizeDiff = int((indexInCache - indexInfo["inCache"]) / reportTime)
+            sizeDiff = int((index_cache_bytes - indexInfo["inCache"]) / reportTime)
             readDiff = int((indexCacheRead - indexInfo["cacheRead"]) / reportTime)
             writeDiff = int((indexCacheWrite - indexInfo["cacheWrite"]) / reportTime)
             pageUseDiff = int((indexPagesUsed - indexInfo["pagesUsed"]) / reportTime)
 
-            # Build descriptive name showing this is an index entry
-            nameTab = ns + " (index: " + indexName + ")"
+            # Adjust cache bytes by removing efficiency factor to get effective cached index
+            adjusted_index_cache = index_cache_bytes / INDEX_CACHE_OVERHEAD
 
-            # Calculate cache percentage and add to table
-            if indexSize > 0:
-                pc = int((indexInCache / indexSize) * 100)
-                table_data.append([nameTab, indexSize, indexInCache, pc, sizeDiff, readDiff, writeDiff, pageUseDiff])
+            # Calculate % Cached using adjusted cache
+            index_cache_pct = (adjusted_index_cache / index_size * 100) if index_size > 0 else 0
+            index_cache_pct = min(index_cache_pct, 100.0)  # Cap at 100%
+
+            # Build namespace with index indicator
+            index_ns = f"{ns}.{indexName}"
+
+            # Add index row to table
+            if index_size > 0:
+                table_data.append([index_ns, "Index", index_cache_bytes, None, index_size,
+                                 f"{index_cache_pct:.1f}%", sizeDiff, readDiff, writeDiff, pageUseDiff])
 
             # Update stored values for next iteration's delta calculation
-            indexInfo["inCache"] = indexInCache
+            indexInfo["inCache"] = index_cache_bytes
             indexInfo["cacheRead"] = indexCacheRead
             indexInfo["cacheWrite"] = indexCacheWrite
             indexInfo["pagesUsed"] = indexPagesUsed
 
-    # Sort table by cached bytes (column index 2) for easier analysis
-    table_data = sorted(table_data, key=lambda kv: kv[2])
+    # Sort table by cached bytes (column index 2) descending for easier analysis
+    table_data = sorted(table_data, key=lambda kv: kv[2], reverse=True)
 
     # Display formatted table
     print(tabulate(table_data, headers, tablefmt="grid"))

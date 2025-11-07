@@ -36,10 +36,12 @@ uv run mongo_cache_stats.py "mongodb://localhost:27017"
 ```
 
 **Output columns:**
-- **Collection**: Database and collection name (includes indexes)
-- **Size**: Total size of collection + indexes
-- **Cached**: Bytes currently in cache
-- **%age**: Percentage of total size that's cached
+- **Namespace**: Database.collection or database.collection.index name
+- **Type**: Collection or Index
+- **Cache Used**: Bytes currently in cache (uncompressed)
+- **Data Size**: Uncompressed data size (collections only)
+- **Storage Size**: Compressed size on disk
+- **% Cached**: Percentage cached (adjusted for overhead: Collections 1.25x, Indexes 0.80x)
 - **Delta**: Change in cached bytes per second
 - **Read**: Bytes read into cache per second
 - **Written**: Bytes written from cache per second
